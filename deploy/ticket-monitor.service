@@ -9,11 +9,19 @@ User=ticket-monitor
 Group=ticket-monitor
 WorkingDirectory=/opt/ticket-monitor
 
-# Fetches secrets from SSM Parameter Store into a tmpfs file every start.
-# Runs as root so it can write to /run/ticket-monitor, then chowns to us.
-PermissionsStartOnly=true
-ExecStartPre=/opt/ticket-monitor/deploy/fetch-secrets.sh
-EnvironmentFile=/run/ticket-monitor/env
+# systemd creates /run/ticket-monitor before the service starts, owned by
+# User:Group, and wipes it on stop. Avoids the "non-existent path" error
+# that ReadWritePaths= would otherwise raise on first boot.
+RuntimeDirectory=ticket-monitor
+RuntimeDirectoryMode=0750
+
+# "+" prefix: run as root, bypassing User= and the sandbox. fetch-secrets.sh
+# needs root to write an env file owned by root:ticket-monitor mode 640.
+ExecStartPre=+/opt/ticket-monitor/deploy/fetch-secrets.sh
+
+# Leading "-": tolerate a missing file. On first start the file doesn't
+# exist yet; ExecStartPre creates it, and ExecStart re-reads it.
+EnvironmentFile=-/run/ticket-monitor/env
 
 ExecStart=/opt/ticket-monitor/.venv/bin/python3 /opt/ticket-monitor/monitor.py
 
@@ -22,7 +30,7 @@ RestartSec=15s
 StandardOutput=journal
 StandardError=journal
 
-# Hardening — monitor has no reason to write outside its own dir
+# Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -33,7 +41,6 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ReadWritePaths=/opt/ticket-monitor /run/ticket-monitor
 
 [Install]
 WantedBy=multi-user.target
