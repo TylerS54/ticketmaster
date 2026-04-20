@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Ticketmaster ticket monitor — single EC2 instance with SSM Session Manager
+  access, egress-only security group, and IAM role that can read secrets from
+  /ticket-monitor/* in SSM Parameter Store.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t4g.nano
+    AllowedValues: [t4g.nano, t4g.micro, t4g.small, t3.nano, t3.micro]
+    Description: t4g.* is ARM (Graviton). If you pick t3.*, change LatestAmiId to the x86_64 variant.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: >
+      Amazon Linux 2023 AMI. Default is ARM64 to match t4g.*. For t3.*, use
+      /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  GitRepoUrl:
+    Type: String
+    Default: ''
+    Description: >
+      Optional public git URL to clone on first boot. Leave blank to upload
+      code manually via Session Manager after the stack is up.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet for the instance. Must have route to the internet (public IP or NAT).
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC containing the subnet.
+
+Resources:
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Grants SSM Session Manager + the bits needed for managed instance
+        # inventory. No SSH keypair required.
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadTicketMonitorParameters
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ticket-monitor/*
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ticket-monitor — egress-only, no inbound ports
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound (TM API, Telegram, SSM endpoints, package repos)
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref SecurityGroup]
+      Tags:
+        - {Key: Name, Value: ticket-monitor}
+      UserData:
+        # !Sub swaps the __GIT_REPO_URL__ marker in user-data.sh for the
+        # parameter value. Keeping the real script in a separate file makes
+        # it easy to edit + shellcheck locally.
+        Fn::Base64: !Sub |
+          #!/usr/bin/env bash
+          set -euxo pipefail
+          APP_DIR="/opt/ticket-monitor"
+          SERVICE_USER="ticket-monitor"
+          GIT_REPO_URL="${GitRepoUrl}"
+
+          dnf -y update
+          dnf -y install python3 python3-pip git awscli
+
+          if ! id "$SERVICE_USER" &>/dev/null; then
+              useradd --system --create-home --home-dir "$APP_DIR" --shell /sbin/nologin "$SERVICE_USER"
+          fi
+
+          if [ -n "$GIT_REPO_URL" ] && [ ! -d "$APP_DIR/.git" ]; then
+              sudo -u "$SERVICE_USER" git clone "$GIT_REPO_URL" "$APP_DIR"
+          fi
+
+          if [ -f "$APP_DIR/requirements.txt" ]; then
+              sudo -u "$SERVICE_USER" python3 -m venv "$APP_DIR/.venv"
+              sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/pip" install --upgrade pip
+              sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"
+          fi
+
+          if [ -f "$APP_DIR/deploy/ticket-monitor.service" ]; then
+              install -m 644 "$APP_DIR/deploy/ticket-monitor.service" \
+                  /etc/systemd/system/ticket-monitor.service
+              chmod +x "$APP_DIR/deploy/fetch-secrets.sh"
+              systemctl daemon-reload
+              systemctl enable ticket-monitor.service
+              systemctl start ticket-monitor.service || true
+          fi
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+    Description: EC2 instance ID
+  SessionManagerCommand:
+    Value: !Sub aws ssm start-session --target ${Instance} --region ${AWS::Region}
+    Description: Open a shell on the instance (requires Session Manager plugin)
+  JournalCommand:
+    Value: !Sub >
+      aws ssm start-session --target ${Instance} --region ${AWS::Region}
+      --document-name AWS-StartInteractiveCommand
+      --parameters command='sudo journalctl -u ticket-monitor -f'
+    Description: Tail the monitor's logs without opening an interactive shell

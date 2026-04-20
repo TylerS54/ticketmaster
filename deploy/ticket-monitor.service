@@ -1,0 +1,39 @@
+[Unit]
+Description=Ticketmaster Ticket Availability Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ticket-monitor
+Group=ticket-monitor
+WorkingDirectory=/opt/ticket-monitor
+
+# Fetches secrets from SSM Parameter Store into a tmpfs file every start.
+# Runs as root so it can write to /run/ticket-monitor, then chowns to us.
+PermissionsStartOnly=true
+ExecStartPre=/opt/ticket-monitor/deploy/fetch-secrets.sh
+EnvironmentFile=/run/ticket-monitor/env
+
+ExecStart=/opt/ticket-monitor/.venv/bin/python3 /opt/ticket-monitor/monitor.py
+
+Restart=on-failure
+RestartSec=15s
+StandardOutput=journal
+StandardError=journal
+
+# Hardening — monitor has no reason to write outside its own dir
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/opt/ticket-monitor /run/ticket-monitor
+
+[Install]
+WantedBy=multi-user.target
