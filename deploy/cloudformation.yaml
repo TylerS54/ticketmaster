@@ -106,10 +106,14 @@ Resources:
           dnf -y install python3 python3-pip git awscli
 
           if ! id "$SERVICE_USER" &>/dev/null; then
-              useradd --system --create-home --home-dir "$APP_DIR" --shell /sbin/nologin "$SERVICE_USER"
+              # No --create-home: useradd would populate $APP_DIR with skeleton
+              # files (.bashrc etc), and `git clone` refuses a non-empty target.
+              useradd --system --home-dir "$APP_DIR" --shell /sbin/nologin "$SERVICE_USER"
           fi
 
           if [ -n "$GIT_REPO_URL" ] && [ ! -d "$APP_DIR/.git" ]; then
+              mkdir -p "$APP_DIR"
+              chown "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
               sudo -u "$SERVICE_USER" git clone "$GIT_REPO_URL" "$APP_DIR"
           fi
 

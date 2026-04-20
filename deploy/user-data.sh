@@ -19,7 +19,9 @@ dnf -y install python3 python3-pip git awscli
 
 # --- Service user ---
 if ! id "$SERVICE_USER" &>/dev/null; then
-    useradd --system --create-home --home-dir "$APP_DIR" --shell /sbin/nologin "$SERVICE_USER"
+    # No --create-home: useradd would populate $APP_DIR with skeleton files
+    # (.bashrc etc), and `git clone` refuses a non-empty target directory.
+    useradd --system --home-dir "$APP_DIR" --shell /sbin/nologin "$SERVICE_USER"
 fi
 
 # --- Fetch code ---
@@ -27,6 +29,8 @@ if [ -n "$GIT_REPO_URL" ] && [ "$GIT_REPO_URL" != "__GIT_REPO_URL__" ]; then
     if [ ! -d "$APP_DIR/.git" ]; then
         # Service user owns the checkout so `git pull` from a deploy script
         # run via Session Manager doesn't need sudo.
+        mkdir -p "$APP_DIR"
+        chown "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
         sudo -u "$SERVICE_USER" git clone "$GIT_REPO_URL" "$APP_DIR"
     fi
 fi
