@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Ticketmaster ticket monitor — single EC2 instance with SSM Session Manager
+  Ticketmaster ticket monitor - single EC2 instance with SSM Session Manager
   access, egress-only security group, and IAM role that can read secrets from
   /ticket-monitor/* in SSM Parameter Store.
 
@@ -74,7 +74,7 @@ Resources:
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: ticket-monitor — egress-only, no inbound ports
+      GroupDescription: ticket-monitor egress-only, no inbound ports
       VpcId: !Ref VpcId
       SecurityGroupEgress:
         - IpProtocol: -1
