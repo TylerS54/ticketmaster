@@ -43,10 +43,20 @@ get() {
         --output text
 }
 
+get_optional() {
+    # Returns empty string if the parameter doesn't exist, instead of failing.
+    aws ssm get-parameter \
+        --name "$1" \
+        --with-decryption \
+        --query 'Parameter.Value' \
+        --output text 2>/dev/null || true
+}
+
 # Fail loudly if required params are missing — no silent degraded startup.
 TM_KEY="$(get "$PREFIX/ticketmaster-api-key")"
 TG_TOKEN="$(get "$PREFIX/telegram-bot-token")"
 TG_CHAT="$(get "$PREFIX/telegram-chat-id")"
+MAX_PRICE="$(get_optional "$PREFIX/max-price")"
 
 # Write atomically (temp file + mv) so a crash mid-write can't leave a
 # partial env file that the service then sources.
@@ -58,6 +68,10 @@ TMP="$(mktemp "$ENV_DIR/env.XXXXXX")"
     # Headless host — no WSL, no desktop alerts.
     printf 'NOTIFY_DESKTOP=0\n'
     printf 'NOTIFY_SOUND=0\n'
+    # Optional: only emit MAX_PRICE if the SSM param is set and non-empty.
+    if [ -n "$MAX_PRICE" ]; then
+        printf 'MAX_PRICE=%s\n' "$MAX_PRICE"
+    fi
 } > "$TMP"
 
 chmod 640 "$TMP"

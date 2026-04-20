@@ -615,17 +615,26 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Ticketmaster ticket availability monitor."
     )
+    # CLI takes precedence; falls back to the MAX_PRICE env var so it can be
+    # set from SSM / systemd EnvironmentFile without editing ExecStart.
+    env_default: Optional[float] = None
+    raw = os.environ.get("MAX_PRICE", "").strip()
+    if raw:
+        try:
+            env_default = float(raw)
+        except ValueError:
+            log.warning("Ignoring invalid MAX_PRICE env var: %r", raw)
     p.add_argument(
         "--max-price",
         type=float,
-        default=None,
+        default=env_default,
         metavar="USD",
         help=(
             "Only fire alerts when the lowest detected ticket price is at or "
-            "below this threshold (in USD). Detections above the threshold "
-            "are logged but not alerted. Detections with no price (API path "
-            "when priceRanges empty, or phrase-only scout match) are also "
-            "suppressed when this flag is set."
+            "below this threshold (in USD). Defaults to the MAX_PRICE env "
+            "var. Detections above the threshold are logged but not alerted. "
+            "Detections with no price (API path when priceRanges empty, or "
+            "phrase-only scout match) are also suppressed when this is set."
         ),
     )
     return p.parse_args(argv)
