@@ -93,6 +93,14 @@ def get_api_key() -> str:
     return key
 
 
+def api_enabled() -> bool:
+    """False disables Discovery API polling entirely — scout-only mode."""
+    override = _env_bool("API_ENABLED")
+    if override is not None:
+        return override
+    return getattr(config, "API_ENABLED", True)
+
+
 def get_telegram_bot_token() -> str:
     return (
         os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -572,23 +580,52 @@ def notify(result: CheckResult) -> None:
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run_check(api_key: str) -> CheckResult:
-    """Run all available checkers and return the most informative result."""
-    results: list[CheckResult] = []
+class _PollState:
+    """Tracks the last time each source was polled and its last result.
 
-    # Primary: API check
-    if api_key:
-        api_result = check_via_api(api_key)
-        results.append(api_result)
-        log.info("[API] %s", api_result.message)
-    else:
-        log.warning("No API key set -- skipping Discovery API check")
+    Mutable by design (not a frozen dataclass). The main loop passes a
+    single instance through `run_check` so per-source timers accumulate
+    across iterations.
+    """
 
-    # Secondary: cortex-scout scrape
-    scout_result = check_via_cortex_scout()
-    results.append(scout_result)
-    if scout_result.status != TicketStatus.UNKNOWN:
-        log.info("[Scout] %s", scout_result.message)
+    __slots__ = ("last_api_at", "last_scout_at", "last_api_result", "last_scout_result")
+
+    def __init__(self) -> None:
+        self.last_api_at: float = 0.0
+        self.last_scout_at: float = 0.0
+        self.last_api_result: Optional[CheckResult] = None
+        self.last_scout_result: Optional[CheckResult] = None
+
+
+def run_check(api_key: str, state: _PollState, now: float) -> CheckResult:
+    """Poll sources that are due; return the most informative cached result.
+
+    Each source is gated by its own interval:
+        - API: config.API_CHECK_INTERVAL_SECS (default 30s — quota-safe)
+        - Scout: config.SCOUT_CHECK_INTERVAL_SECS (default 10s — cycle floor)
+
+    Results from sources that aren't due are reused from the last call,
+    so precedence logic still sees both sources on every iteration.
+    """
+    api_due = (
+        api_enabled()
+        and api_key
+        and (now - state.last_api_at) >= config.API_CHECK_INTERVAL_SECS
+    )
+    scout_due = (now - state.last_scout_at) >= config.SCOUT_CHECK_INTERVAL_SECS
+
+    if api_due:
+        state.last_api_result = check_via_api(api_key)
+        state.last_api_at = now
+        log.info("[API] %s", state.last_api_result.message)
+
+    if scout_due:
+        state.last_scout_result = check_via_cortex_scout()
+        state.last_scout_at = now
+        if state.last_scout_result.status != TicketStatus.UNKNOWN:
+            log.info("[Scout] %s", state.last_scout_result.message)
+
+    results = [r for r in (state.last_api_result, state.last_scout_result) if r is not None]
 
     # Prefer AVAILABLE from any source
     for r in results:
@@ -600,7 +637,6 @@ def run_check(api_key: str) -> CheckResult:
         if r.status != TicketStatus.UNKNOWN:
             return r
 
-    # All unknown
     if results:
         return results[0]
 
@@ -609,6 +645,18 @@ def run_check(api_key: str) -> CheckResult:
         source="none",
         message="No checkers available (set TICKETMASTER_API_KEY or start cortex-scout)",
     )
+
+
+def _next_due_sleep(state: _PollState, api_key: str) -> float:
+    """Seconds until the next source is due to poll. Floors at 0."""
+    now = time.time()
+    scout_due_at = state.last_scout_at + config.SCOUT_CHECK_INTERVAL_SECS
+    if api_key and api_enabled():
+        api_due_at = state.last_api_at + config.API_CHECK_INTERVAL_SECS
+        next_at = min(api_due_at, scout_due_at)
+    else:
+        next_at = scout_due_at
+    return max(0.0, next_at - now)
 
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -649,8 +697,16 @@ def main() -> None:
     log.info("Ticketmaster Ticket Monitor")
     log.info("Event: %s", config.EVENT_NAME)
     log.info("URL:   %s", config.EVENT_URL)
-    log.info("Check interval: %ds (+%ds jitter)", config.CHECK_INTERVAL_SECS, config.JITTER_SECS)
-    log.info("API key: %s", "configured" if api_key else "NOT SET")
+    log.info(
+        "API poll: %ds | Scout poll: %ds (+%ds jitter)",
+        config.API_CHECK_INTERVAL_SECS,
+        config.SCOUT_CHECK_INTERVAL_SECS,
+        config.JITTER_SECS,
+    )
+    if api_enabled():
+        log.info("API key: %s", "configured" if api_key else "NOT SET")
+    else:
+        log.info("API: disabled (scout-only mode)")
     log.info("cortex-scout: %s", "running" if cortex_scout_available() else "not detected")
     log.info(
         "Desktop alerts: %s (PowerShell %s)",
@@ -662,30 +718,33 @@ def main() -> None:
         log.info("Price threshold: alerts only when lowest price <= $%.2f", max_price)
     log.info("=" * 60)
 
-    if not api_key and not cortex_scout_available():
+    api_live = api_enabled() and bool(api_key)
+    if not api_live and not cortex_scout_available():
         log.error(
-            "No data sources available! Set TICKETMASTER_API_KEY env var "
-            "or start cortex-scout. Get a free API key at: "
-            "https://developer.ticketmaster.com/"
+            "No data sources available! Either enable the API (API_ENABLED=1 "
+            "+ TICKETMASTER_API_KEY set) or start cortex-scout. Get a free "
+            "API key at: https://developer.ticketmaster.com/"
         )
         sys.exit(1)
 
     # Send startup message to Telegram
     if telegram_enabled():
         sources = []
-        if api_key:
+        if api_live:
             sources.append("Discovery API")
         if cortex_scout_available():
             sources.append("cortex-scout")
         notify_telegram(
             "Ticket Monitor Started",
             f"Watching: {config.EVENT_NAME}\n"
-            f"Checking every ~{config.CHECK_INTERVAL_SECS}s\n"
+            f"API every {config.API_CHECK_INTERVAL_SECS}s, "
+            f"Scout every {config.SCOUT_CHECK_INTERVAL_SECS}s\n"
             f"Sources: {', '.join(sources)}",
         )
 
     check_count = 0
     last_notify_time = 0.0
+    state = _PollState()
 
     try:
         while True:
@@ -693,7 +752,7 @@ def main() -> None:
             now_str = datetime.now().strftime("%H:%M:%S")
             log.info("--- Check #%d at %s ---", check_count, now_str)
 
-            result = run_check(api_key)
+            result = run_check(api_key, state, time.time())
 
             if result.status == TicketStatus.AVAILABLE:
                 price = result.lowest_price_usd
@@ -729,7 +788,7 @@ def main() -> None:
             else:
                 log.info("Status unknown. Waiting...")
 
-            sleep_time = config.CHECK_INTERVAL_SECS + random.uniform(0, config.JITTER_SECS)
+            sleep_time = _next_due_sleep(state, api_key) + random.uniform(0, config.JITTER_SECS)
             log.info("Next check in %.0f seconds", sleep_time)
             time.sleep(sleep_time)
 
